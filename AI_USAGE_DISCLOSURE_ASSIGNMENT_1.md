@@ -9,7 +9,7 @@
 
 I used **Claude (Anthropic, claude-sonnet model)** as an intellectual sparring partner throughout this assignment.
 
-I chose Claude specifically because I wanted a tool capable of engaging at a conceptual level — one that could challenge my reasoning and push back on assumptions, rather than simply generating structured output on demand. For a QA assignment where the quality of thinking matters more than the formatting of answers, I needed a tool that would function like a knowledgeable peer reviewer rather than a writing assistant.
+I chose Claude specifically because I wanted a tool capable of engaging at a conceptual level — one that could challenge my reasoning and push back on assumptions, rather than simply generating structured output on demand. For a QA assignment where the quality of thinking matters more than the formatting of answers, I needed a tool that would function like a knowledgeable peer reviewer rather than a writing assistant. I also used it for formatting to make my solution more structured, which would give me a competitive advantage.
 
 ---
 
