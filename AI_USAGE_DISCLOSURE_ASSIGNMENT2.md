@@ -10,7 +10,7 @@
 
 I used **Claude (Anthropic, claude-sonnet model)** as a technical collaborator for this assignment.
 
-I chose Claude for the same reason I chose it for Assignment 1 — I wanted a tool capable of reasoning through a problem interactively, not one that generates a formatted answer on the first prompt. For a Wireshark analysis task where the file format itself was the first obstacle, I needed something I could have a real back-and-forth with: "this is what I'm seeing in the bytes, what does it mean?" That kind of iterative technical dialogue is where Claude is strongest.
+I chose Claude for the same reason I chose it for Assignment 1 — I wanted a tool capable of reasoning through a problem interactively, not one that generates a formatted answer on the first prompt. For a Wireshark analysis task where the file format itself was the first obstacle, I needed something I could have a real back-and-forth with: "this is what I'm seeing in the bytes, what does it mean?" That kind of iterative technical dialogue is where Claude is strongest. I also used it for formatting to make my solution more structured, which would give me a competitive advantage.
 
 ---
 
