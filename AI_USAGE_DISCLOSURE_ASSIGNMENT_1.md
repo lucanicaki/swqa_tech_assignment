@@ -1,4 +1,4 @@
-# AI Tool Usage Disclosure
+# AI Tool Usage Disclosure — Assignment 1
 
 **Assignment:** Software QA Technical Assignment — Bang & Olufsen  
 **Document type:** AI usage transparency statement (as required by assignment instructions)
