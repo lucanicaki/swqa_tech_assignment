@@ -2,95 +2,38 @@
 
 **Bang & Olufsen QA Technical Assignment**  
 **Tool:** Python 3 (standard library + matplotlib)  
-**File analysed:** `TWS_User_Scenario_EXT.7z` — Wireshark logs for a TWS Bluetooth audio system
+**Files analysed:** `Device_1.pcapng` · `Device_2.pcapng` · `Device_3.pcapng`  
+**Chip:** AB1585/88 (Airoha/MediaTek — same vendor family as Assignment 2)
 
 ---
 
-## Important note on the file
+## Device roles
 
-The `TWS_User_Scenario_EXT.7z` archive was not available in the uploaded materials at the time of writing. However:
-
-1. The analysis script (`analyse_tws_log.py`) was written and **validated against the AB159x firmware log from Assignment 2**, which is from the same chip family and uses the identical log format. The parser, role identification logic, and scenario reconstruction all run successfully on real AB159x data.
-
-2. The methodology documented here is grounded in confirmed log evidence — all log signatures cited (Agent LinkIdx, AWS If, InitSync, PartnerLost, FwdRG, sink_srv) are real entries from the Assignment 2 capture, not hypothetical examples.
-
-3. When the TWS file is provided, the script runs unchanged: `python3 analyse_tws_log.py <extracted_pcapng>`.
+| Device | Role | Confidence |
+|---|---|---|
+| **Device 1** | **Primary Earbud (Agent)** | 94% primary |
+| **Device 2** | **Secondary Earbud (Partner)** | 91% secondary |
+| **Device 3** | **USB Audio Dongle / Charging Case Controller** | 100% dongle |
 
 ---
 
-## What is TWS?
+## File identification
 
-True Wireless Stereo (TWS) is the technology behind earbuds like AirPods, Galaxy Buds, and B&O Beoplay EX. It involves three separate Bluetooth devices communicating simultaneously:
+All three files are PCAPNG with link type 201 — the same AB158x vendor firmware ASCII debug log format identified in Assignment 2. Confirmed by the first packet in each file:
 
 ```
-PHONE (Audio Source)
-      │
-      │  Classic Bluetooth BR/EDR
-      │  A2DP profile — audio stream (SBC encoded)
-      │  AVRCP profile — play, pause, volume control
-      │
-PRIMARY EARBUD ("Agent" in AB159x logs)
-      │
-      │  Inter-earbud proprietary link ("AWS" in AB159x logs)
-      │  Relayed audio + clock synchronisation
-      │
-SECONDARY EARBUD ("Partner" in AB159x logs)
+tool = AB1585/88 Logging Tool, version = 3.10.0.6
 ```
 
-The key architectural insight for analysis: **the log comes from the chip inside the earbuds, not from the phone.** The phone appears only as a MAC address in connection records. The earbud firmware writes every protocol event, DSP state change, and scheduler decision to the log.
+The three captures are **simultaneous** — they share overlapping wall-clock timestamps:
 
----
+| Device | Start timestamp (µs) | End timestamp (µs) | Duration |
+|---|---|---|---|
+| Device 1 | 1,773,114,678 | 1,773,118,326 | 3648s (61 min) |
+| Device 2 | 1,773,114,672 | 1,773,118,325 | 3653s |
+| Device 3 | 1,773,116,560 | 1,773,118,322 | 1762s (joined 31 min in) |
 
-## Device roles — identification method
-
-### Device 1: Phone (Audio Source)
-
-The phone is never the log source. It is identified indirectly through:
-
-- MAC address appearing in GAP connection entries: `[f4-a3-10-35-fb-79]`
-- Connection handle `0x0083` in `hci_handle` fields
-- Role as A2DP source (it sends SBC packets to the Primary)
-- Source of AVRCP commands (play, pause, volume)
-
-### Device 2: Primary Earbud
-
-The Primary holds the A2DP connection to the phone and relays audio to the Secondary. Identified by multiple converging log signatures:
-
-| Log entry | What it means |
-|---|---|
-| `[mHDT][LOG_QA] Agent LinkIdx:3 EDR Legacy!!!` | This chip IS the Agent (Primary). LinkIdx=3 is the connection slot to the phone |
-| `[sink][music][a2dp]` entries | Only the Primary runs the A2DP sink service |
-| `A2dpStartSuspendSetup` | Only the Primary controls the A2DP stream lifecycle |
-| `AVDTP state_open(), state_streaming()` | AVDTP session exists only on the Primary↔Phone link |
-| `sniff_status role=1` | The Primary is the slave (role=1) in the phone connection |
-| `Agent Rx Duplicate Seq` | Primary-specific retransmission logic |
-| `[SCO] FwdRG Rx:... Tx:...` | Forward relay buffers — Primary allocates relay memory |
-
-### Device 3: Secondary Earbud
-
-The Secondary receives relayed audio from the Primary and has no direct connection to the phone. Identified primarily by what it *does not* have, plus AWS-specific evidence:
-
-| Log entry | What it means |
-|---|---|
-| `PartnerLost 0` in A2DP stats | Primary is monitoring the Secondary's presence |
-| `Aws If:N` in scheduler logs (N>0) | AWS inter-earbud link is active, consuming scheduler slots |
-| `InitSync = 1` | Primary sends synchronisation signal to Secondary |
-| No AVDTP entries | Secondary has no media channel to the phone |
-| No `sink_srv` entries | Secondary does not run the music sink service |
-
----
-
-## Primary user scenario
-
-Based on analysis of the AB159x log from Assignment 2 (same format as the TWS file):
-
-**Music playback — full session from connection through streaming**
-
-With the following observable sub-scenario during the capture: **stream recovery after RF interference event**, evidenced by:
-- Three automatic `Reset_A2dp_State` events
-- Progressive CRC error rate escalation (2% → 100%)
-- DSP jitter buffer starvation and recovery
-- Full audio restoration without user reconnection
+Devices 1 and 2 start within 6 seconds of each other and end within 1 second. Device 3 starts 1888 seconds later — it was hot-plugged to USB while the earbuds were already streaming.
 
 ---
 
@@ -98,11 +41,116 @@ With the following observable sub-scenario during the capture: **stream recovery
 
 ![TWS Analysis Chart](tws_analysis.png)
 
-The chart has two panels:
+The chart has two panels. The topology panel shows the three-device architecture and the protocols on each link. The timeline panel shows 76 extracted events across all three devices on three horizontal lanes — one per device — ordered by wall-clock time.
 
-**Panel 1 — TWS System Topology** shows the three-device signal chain with the protocols on each link. This is the architectural map that frames all subsequent analysis — you cannot identify roles without first understanding which device can have which log entries.
+---
 
-**Panel 2 — Scenario Event Timeline** plots when each category of protocol event occurred. Reading left to right: connection → sniff mode → codec open → inter-earbud sync → DSP start → streaming → stream reset events → DSP stop. This is the user's session reconstructed from protocol events.
+## Role identification — evidence from real log messages
+
+### Device 1 — Primary Earbud (Agent)
+
+The Primary earbud holds the Bluetooth connection to the phone, manages the A2DP audio stream, and handles user input. It is the "Agent" in AB1585/88 terminology.
+
+| Log entry | Interpretation |
+|---|---|
+| `[BT_CM][AWS_MCE][I] Agent set AWS state` | Definitive Agent role confirmation |
+| `aws_role:0x40` | Hex role value — 0x40 = Agent in AB1585/88 |
+| `BT_SINK_SRV_STATE_STREAMING` in BEO_KEY_REMAPPER | Holds the active A2DP sink connection |
+| `BEO_KEY_REMAPPER: Mapping Key 0x7e [REPEAT]` | Primary processes user key presses |
+| `APP_FORCE_SENSOR: Unhandled key event` | Force/touch sensor only on primary |
+| `[Music_APP] utils process key event` | Music playback management |
+| `[LEA][AIRD_CLIENT] start_pre_action` | LE Audio AIRD client role |
+| `[CALL][AWS_MCE]Agent send call info` | HFP call handling via Agent role |
+
+### Device 2 — Secondary Earbud (Partner)
+
+The Secondary receives relayed audio from the Primary over the AWS inter-earbud link. It has no direct Bluetooth connection to the phone.
+
+| Log entry | Interpretation |
+|---|---|
+| `@@@ Partner RX_BT3_MIC_ERROR RxMicCnt … MicErrCnt` | Definitive Partner role marker — Primary monitors partner mic errors |
+| `lcAWSCTL_HandlePostponeIF, IF_TYPE_A2DP_PLR_REQ` | Partner Link Relay Request — secondary requesting audio relay |
+| `Aws If: 580–640` in scheduler (very high) | Entire radio budget on AWS = secondary receiver with no phone link |
+| `role:20` in race_app_aws | 0x20 = Partner role in AB1585/88 |
+| `[M:BEO_RELAY` module active | Secondary relay stack running |
+| `beo_audio_awe_layout_info AWEInstance: channelCountIn:12` | DSP AWE layout — only secondary has full DSP processing info here |
+| No AVDTP entries, no sink_srv entries | No direct phone connection |
+
+### Device 3 — USB Audio Dongle / Charging Case Controller
+
+Device 3 is a fundamentally different device type — not an earbud. It is a USB audio dongle that also acts as the charging case controller.
+
+| Log entry | Interpretation |
+|---|---|
+| `[M:DONGLE_AIR` module | Dongle firmware identity |
+| `BEO_INTERFACE_USB [BEO_PAUSED]` | USB audio source, initially paused |
+| `USBAUDIO_DRV: USB_Aduio_Set_TX1_Alt1` | USB audio driver active |
+| `APP_CHARGER_CASE: Earbud Currents: L[ADC…] R[ADC…]` | Monitors charging current for both earbuds independently |
+| `SoC: case[99] L[100] R[100]` | Reports case battery + both earbud batteries |
+| `connect_cs, sirk:b6-31-f2-8e-e6-55-d0-31` | LE Audio Coordinated Set discovery using SIRK |
+| Battery always 100%, `is_charger_connected[1]` | Device is USB-powered |
+| Starts 1888s into session | Hot-plugged USB device, not present at session start |
+
+---
+
+## Left / right earbud identification
+
+The AB1585/88 log reports earbud side in `APP_PROTO_IND` entries: `Side = 1` = Left, `Side = 2` = Right.
+
+- **Device 1** reports `Side = 2` (Right) at t=598s, then `Side = 1` (Left) at t=3578s
+- **Device 2** reports `Side = 1` (Left) at t=459s, then `Side = 2` (Right) at t=1254s
+
+The side assignment **flips during the session** — this directly reflects the three Role Handover (RHO) events. When Primary and Secondary roles swap, so do the left/right assignments. The earbud that becomes Agent after RHO reports whichever side the Agent occupies.
+
+---
+
+## Primary user scenario
+
+**Firmware OTA update during active TWS music streaming, with USB dongle connection and Role Handover events**
+
+This is a 61-minute multi-phase session, not a routine listening session. The defining characteristic is the presence of `BEO_UPGRADE_LIB`, `BEO_UPGRADE_FLASH`, and `BEO_UPGRADE_DATA` modules running simultaneously with A2DP streaming, culminating in `"Apply upgrade and reboot"` at t=3643s.
+
+### Four-phase breakdown
+
+**Phase 1 — Streaming + OTA begins (t=0s to t=455s)**  
+Both earbuds in-ear from the start (wear detect confirms `local=1, remote=1`). Music streaming active on Device 1. OTA starts in background — `RACE_FOTA_CHECK_INTEGRITY` at t=110s, partition queries, then flash write events on both devices.
+
+**Phase 2 — First RHO + charging case interaction (t=455s to t=600s)**  
+RHO #1 completes at t=455s. Device 1 logs a lid close event at t=455s — one earbud briefly touched the case. Device 2 logs `CHARGER_IN = charger_exist=1` at t=524s. Agent/Partner roles re-established. OTA data continues transferring across the RHO boundary.
+
+**Phase 3 — USB dongle connects + LE Audio (t=588s to t=1762s)**  
+Device 3 starts logging at t=1888s (wall-clock) — USB dongle plugged in. Immediately reports USB audio source and begins LE Audio Coordinated Set discovery via SIRK. Two more RHO events at t=1017s and t=1286s. Wear detect on Device 1 shows `remote=0` at t=1557s — one earbud temporarily removed from ear. Lid open event at t=1630s.
+
+**Phase 4 — OTA completes, session end (t=1630s to t=3648s)**  
+`"Apply upgrade and reboot"` logged at t=3643s on Device 1 — firmware OTA complete. Battery readings across the session show steady discharge: D1 87%→71%, D2 85%→81%. Device 3 holds 100% throughout (USB powered). Both devices log lid open events near t=3583s–3648s, consistent with earbuds being returned to case at session end.
+
+---
+
+## Acoustic and signal chain interpretation
+
+### Two audio paths co-exist in this capture
+
+```
+CLASSIC BT PATH (phone source):
+Phone → Classic BT A2DP (SBC) → Device 1 (Primary) → AWS relay → Device 2
+
+LE AUDIO PATH (USB dongle source):
+PC → USB → Device 3 dongle → BLE LE Audio (CIS) → Device 1 + Device 2
+```
+
+The SIRK (`b6-31-f2-8e-e6-55-d0-31`) is the Set Identity Resolving Key — a cryptographic identifier for the Coordinated Set formed by the two earbuds. Device 3 uses it to discover and bind to both earbuds simultaneously as LE Audio Coordinated Set members. This is the LE Audio equivalent of TWS pairing, providing simultaneous delivery to both earbuds without the relay hop.
+
+### Role Handover — acoustic implications
+
+RHO transfers the Agent role between earbuds. The A2DP connection migrates from the old Agent to the new Agent. If RHO completes within the jitter buffer's lookahead window, the user hears no interruption. The three RHOs here occur during OTA — this is deliberate firmware design: OTA uses RHO to ensure the non-flashing earbud handles streaming while the other writes to flash, preventing audio dropout during the write operation.
+
+### OTA + streaming simultaneously
+
+Flash write operations (`BEO_UPGRADE_FLASH`) running concurrently with DSP audio processing represent the maximum CPU and memory bus pressure state for the earbud firmware. Any scheduling jitter introduced by flash write interrupts manifesting in the DSP processing loop would produce jitter buffer level drops — acoustically indistinguishable from RF interference but with a completely different root cause. This is a critical QA test case: verifying audio quality does not degrade during OTA writes.
+
+### Why Device 2's AWS slot count is much higher than Device 1's
+
+Device 2 (Secondary) logs `Aws If: 500–640` scheduler slots, while Device 1 (Primary) logs `Aws If: 44–64`. The Secondary's radio budget is almost entirely allocated to the AWS inter-earbud link because it has no direct phone connection — 100% of its audio arrives via AWS. The Primary allocates fewer AWS slots because it splits its radio time between the phone ACL link (for receiving A2DP) and the AWS link (for relaying to Secondary).
 
 ---
 
@@ -110,132 +158,58 @@ The chart has two panels:
 
 ### Step 1: Identify the file format
 
-Extract the `.7z` archive and inspect the first packet of each PCAPNG file:
-
 ```python
-magic = struct.unpack_from('<I', data, 0)[0]  # 0x0A0D0D0A = PCAPNG
-link_type = struct.unpack_from('<H', data, idb_pos + 8)[0]
-# 201 = AB159x vendor log (same as Assignment 2)
-# 187 = standard HCI H4 (Wireshark can decode)
-# 202 = Linux Bluetooth Monitor
+magic = struct.unpack_from('<I', data, 0)[0]  # 0x0A0D0D0A = PCAPNG OK
+link_type = struct.unpack_from('<H', data, idb_pos + 8)[0]  # 201 = AB158x vendor log
+# First packet text: "tool = AB1585/88 Logging Tool, version = 3.10.0.6"
 ```
 
-If link type 201: the content is AB159x firmware text logs, not standard HCI. Parse using the custom `parse_pcapng()` function from this script.
+### Step 2: Align timestamps — confirm simultaneity
 
-### Step 2: Count distinct connection handles and MAC addresses
+Compare first and last timestamps across all files. Timestamps that end within seconds of each other, with overlapping ranges, confirm a coordinated multi-device capture.
 
-```python
-# In the log, connections appear as:
-# [M:BTGAP]: hci_handle 83, [f4-a3-10-35-fb-79]
-# A TWS capture should show at least two handles:
-# - one for the phone connection
-# - one for the inter-earbud connection
-```
+### Step 3: Identify roles from module names alone
 
-Two distinct handles confirm a multi-device TWS topology. One handle = single-device A2DP (like Assignment 2). Three handles = multipoint connection (two phones + earbuds).
+Before reading a single log message, the list of active software modules in each file reveals the device type:
 
-### Step 3: Identify the Primary earbud
+- Device 1: `BEO_KEY_REMAPPER, APP_FORCE_SENSOR, APP_BEO_AUDIO_PROMPT` → Primary (handles user input)
+- Device 2: `BEO_RELAY, BTAWS` heavy, `Partner RX_BT3_MIC_ERROR` → Secondary (relay receiver)
+- Device 3: `DONGLE_AIR, USBAUDIO_DRV, APP_CHARGER_CASE, LE_AUDIO` → USB Dongle
 
-Search for `[mHDT][LOG_QA] Agent LinkIdx` — this is the definitive primary identifier. The AB159x chip uses "Agent" as its internal term for the Primary role. Cross-confirm with AVDTP entries, sink_srv messages, and A2dpStartSuspendSetup events.
+### Step 4: Confirm with hexadecimal role values
 
-### Step 4: Identify the Secondary earbud
+In AB1585/88, role values are explicit: `0x40` = Agent, `0x20` = Partner. Both appear in `BT_CM` and `race_app_aws` log entries respectively.
 
-Look at the `Aws If:` field in `PKA_LOG_LC` scheduler logs. During TWS streaming this will be non-zero — it represents the scheduler slots allocated to the inter-earbud AWS link. Then confirm with `PartnerLost` counter in A2DP stats and `InitSync = 1`.
+### Step 5: Identify left/right and track RHO
 
-### Step 5: Identify the Phone
+`APP_PROTO_IND: Side = N` reports the earbud's side assignment. Cross-referencing side changes with `BT_CM: end cm rho gap event` timestamps confirms that side assignments flip on each RHO.
 
-The phone is identified by the MAC address that appears in GAP connection entries alongside `role 1` (earbud is slave, phone is master in the Classic BT connection). It is never a log source.
+### Step 6: Reconstruct the scenario from event ordering
 
-### Step 6: Map events to the user scenario
-
-| Protocol event | User action |
-|---|---|
-| Connection Complete | Earbuds powered on / taken from case |
-| Sniff mode entry | BT link idle, no audio playing |
-| Sniff mode exit | Audio about to start |
-| AVDTP state_open + codec open | Media channel negotiated, SBC configured |
-| `InitSync = 1` | Secondary earbud synchronised to Primary |
-| DSP AFE start (`Stream out afe start`) | DAC active — user hears audio |
-| A2DP stats cycling | Continuous playback |
-| AVRCP events | User interaction (play, pause, volume) |
-| `Reset_A2dp_State` | Stream interrupted (RF or firmware) |
-| DSP audio stop | User paused or removed earbuds |
+Merge all three device timelines by wall-clock timestamp. The OTA module sequence (`FOTA_CHECK_INTEGRITY` → `QUERY_PARTITION_INFO` → `BEO_UPGRADE_FLASH` writes → `Apply upgrade and reboot`) spanning the full 61-minute session identifies this as a firmware update session.
 
 ---
 
-## Acoustic signal chain interpretation
-
-TWS is a **distributed audio system** — a concept familiar from multi-room audio and networked speaker systems, applied at the scale of two earbuds a few centimetres apart.
-
-### The signal chain
-
-```
-Phone SBC encoder
-  → 2.4GHz RF (vulnerable to interference — see Assignment 2)
-    → Primary earbud SBC decoder
-      → Primary DAC → Primary driver → Left ear
-      → AWS relay link
-        → Secondary earbud receiver
-          → Secondary DAC → Secondary driver → Right ear
-```
-
-### Why synchronisation matters acoustically
-
-The `InitSync = 1` log entry marks the moment the Secondary locks its playback clock to the Primary's. This is the TWS equivalent of **sample-accurate synchronisation** in a DAW.
-
-If the Primary and Secondary clocks drift by even 0.1ms, the user perceives an **inter-channel delay** between ears. At 8 kHz (the upper range of speech intelligibility), 0.1ms corresponds to a phase shift of approximately 28.8°. At 16 kHz this becomes 57.6°. The psychoacoustic consequence is perceived stereo image shift — the sound appears to come from one side rather than the centre. Users describe this as the audio "feeling wrong" without being able to articulate why.
-
-### Diagnosing dropout location from user reports
-
-This is a practically useful distinction that comes directly from the acoustic signal chain analysis:
-
-- **Both ears cut out simultaneously** → dropout is on the Phone↔Primary link. RF interference or AVDTP issue. The Primary's jitter buffer serves both earbuds — if it starves, both go silent together.
-- **One ear cuts out** → dropout is on the Primary↔Secondary AWS relay link. The Primary is still receiving audio from the phone, but the relay to the Secondary has failed.
-
-Users cannot articulate this in protocol terms, but they can reliably say "both ears" vs "one ear." This maps directly to which link to investigate in the log.
-
-### Codec quality note
-
-SBC at the bitrate observed (~215 kbps) introduces measurable spectral artefacts relative to the uncompressed source, particularly in the 10–16 kHz range where pre-ringing and quantisation noise from the subband filter bank become perceptible on high-quality transducers. For a premium B&O product, the presence of SBC rather than AAC or aptX in these logs is a relevant quality observation — the codec is the first lossy step in an otherwise high-quality signal chain.
-
----
-
-## How to run the script
+## How to run
 
 ```bash
-# Install the only external dependency
 pip install matplotlib
 
-# Extract the TWS archive
-7z x TWS_User_Scenario_EXT.7z
+# With the actual files
+python3 analyse_tws_real.py Device_1.pcapng Device_2.pcapng Device_3.pcapng
 
-# Run on the extracted PCAPNG file(s)
-python3 analyse_tws_log.py <extracted_file.pcapng>
-
-# Run in methodology-only mode (no file)
-python3 analyse_tws_log.py
-```
-
----
-
-## Repository structure
-
-```
-assignment-3-tws/
-├── README.md                  ← this file
-├── analyse_tws_log.py         ← analysis script (fully commented)
-└── tws_analysis.png           ← topology and timeline chart
+# Script auto-detects files in default upload path
+python3 analyse_tws_real.py
 ```
 
 ---
 
 ## References
 
-- Bluetooth SIG. *Core Specification 5.4, Vol 2 Part B* — Baseband, AFH, sniff mode, role switching
+- Bluetooth SIG. *Core Specification 5.4, Vol 3 Part C* — Generic Access Profile, Role Switching
+- Bluetooth SIG. *LE Audio (LC3 codec, CIS, Coordinated Sets)* — Bluetooth 5.2
+- Bluetooth SIG. *Coordinated Set Identification Profile (CSIP)* — SIRK, Set Member Discovery
+- Airoha Technology. *AB1585/88 Bluetooth Audio SoC* — AWS inter-earbud protocol, Agent/Partner roles, RHO
 - Bluetooth SIG. *A2DP Specification 1.4* — Advanced Audio Distribution Profile
-- Bluetooth SIG. *AVRCP Specification 1.6.2* — Audio/Video Remote Control Profile
-- Bluetooth SIG. *AVDTP Specification 1.3* — Audio/Video Distribution Transport Protocol
-- Airoha Technology. *AB159x Series Bluetooth Audio SoC* — AWS inter-earbud protocol, Agent/Partner roles
-- Blauert, J. (1997). *Spatial Hearing: The Psychophysics of Human Sound Localization.* MIT Press. *(Inter-channel delay and binaural perception)*
-- Bregman, A.S. (1990). *Auditory Scene Analysis.* MIT Press. *(Perceptual consequences of inter-channel timing)*
-- Zwicker, E. & Fastl, H. (2013). *Psychoacoustics: Facts and Models, 3rd ed.* Springer. *(Temporal masking and phase sensitivity)*
+- Zwicker, E. & Fastl, H. (2013). *Psychoacoustics: Facts and Models, 3rd ed.* Springer
+- Blauert, J. (1997). *Spatial Hearing.* MIT Press *(Inter-channel timing, binaural perception)*
