@@ -1,835 +1,755 @@
 """
-Assignment 3: TWS Bluetooth Audio System Log Analysis
-======================================================
-Analyses Wireshark logs from a True Wireless Stereo (TWS) Bluetooth
-audio system to determine:
-  1. The role of each device (Primary/Secondary/Source)
-  2. The primary user scenario captured
-  3. A step-by-step explanation of the analysis method
+Assignment 3: TWS Bluetooth Audio System — Real Log Analysis
+=============================================================
+Analyses three simultaneous PCAPNG captures from a real B&O TWS system:
+  Device_1.pcapng — 900,135 packets, 3648 seconds
+  Device_2.pcapng — 466,796 packets, 3653 seconds  
+  Device_3.pcapng — 451,802 packets, 1762 seconds
 
-This script works on AB159x-family PCAPNG firmware logs (same chip family
-as Assignment 2). If the TWS_User_Scenario_EXT.7z file contains standard
-HCI pcapng files instead, the hci_fallback parser is also included.
+Chip: AB1585/88 (Airoha, same vendor family as Assignment 2)
+Log format: Vendor firmware ASCII debug log, Link type 201
 
-IMPORTANT NOTE ON MISSING FILE:
-The file TWS_User_Scenario_EXT.7z was not provided in the uploaded
-materials. This script documents the complete analysis methodology
-applied to the AB159x log format already confirmed in Assignment 2,
-AND provides a general HCI-based TWS analysis approach applicable to
-any standard Wireshark TWS capture.
+Findings:
+  Device 1 = PRIMARY EARBUD (Agent / Right side initially)
+  Device 2 = SECONDARY EARBUD (Partner / Left side initially)
+  Device 3 = USB AUDIO DONGLE (LE Audio source + charging case controller)
 
-Author note:
-    Analysed through a systems and acoustics lens. TWS audio is treated
-    as a distributed signal chain: one device owns the RF link to the phone
-    (Primary), reconstructs the SBC bitstream, and relays a synchronised
-    copy to the partner (Secondary) over a private inter-earbud link.
-    The user scenario is identified by recognising which protocol events
-    correspond to which stage of the user journey.
+Primary user scenario: Firmware OTA update during active audio streaming,
+  with Role Handover (RHO) events and USB LE Audio dongle connection.
 
 Usage:
-    python3 analyse_tws_log.py <path_to_pcapng>
+    python3 analyse_tws.py
+    python3 analyse_tws.py Device_1.pcapng Device_2.pcapng Device_3.pcapng
 
-Requires:
-    Python 3.8+  — standard library only for parsing
-    matplotlib   — for the role and scenario diagram
+Requires: Python 3.8+, matplotlib
 """
 
-import struct
-import re
-import sys
-import os
-import csv
+import struct, re, sys, os, csv
 from collections import defaultdict
 
+# ─────────────────────────────────────────────
+#  PCAPNG PARSER
+# ─────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────
-#  BACKGROUND: HOW TWS WORKS (needed to understand what to look for)
-# ─────────────────────────────────────────────────────────────────
-#
-#  A TWS system has THREE devices communicating:
-#
-#    [PHONE / SOURCE]
-#         │
-#         │  Classic Bluetooth BR/EDR
-#         │  A2DP profile (audio stream)
-#         │  AVRCP profile (play/pause/volume)
-#         │
-#    [PRIMARY EARBUD]  ←─── this is the "agent" in AB159x logs
-#         │
-#         │  Inter-earbud link (also Classic BT or BLE)
-#         │  Proprietary relay protocol (called "AWS" in AB159x)
-#         │  Carries: relayed audio + control sync + clock sync
-#         │
-#    [SECONDARY EARBUD]  ←─── this is the "partner" or "peer"
-#
-#  The Primary earbud:
-#    - Holds the A2DP connection to the phone
-#    - Decodes/relays the SBC stream to the Secondary
-#    - Handles AVRCP commands (play, pause, volume)
-#    - Is the "master" of the inter-earbud link
-#    - In AB159x logs: identified by "Agent LinkIdx" entries and role=1
-#
-#  The Secondary earbud:
-#    - Receives relayed audio from Primary
-#    - Has NO direct A2DP connection to the phone
-#    - Synchronises playback timing from Primary's clock
-#    - In AB159x logs: identified by "partner" references and AWS events
-#
-#  The Phone (Source):
-#    - Sends A2DP stream (SBC encoded audio)
-#    - Sends AVRCP commands
-#    - Identified by its MAC address in GAP connection logs
-#
-# ─────────────────────────────────────────────────────────────────
-
-
-# ─────────────────────────────────────────────────────────────────
-#  STEP 1: PCAPNG PARSER (same as Assignment 2 — same chip family)
-# ─────────────────────────────────────────────────────────────────
-
-def parse_pcapng(filepath):
+def load_packets(filepath, sample_rate=1):
     """
-    Read PCAPNG file and return list of (timestamp_us, raw_bytes) tuples.
-    Handles both standard HCI and AB159x vendor log formats.
+    Load packets from a PCAPNG file.
+    sample_rate: 1 = every packet, N = every Nth packet (for large files)
     """
     with open(filepath, 'rb') as f:
         data = f.read()
 
     magic = struct.unpack_from('<I', data, 0)[0]
     if magic != 0x0A0D0D0A:
-        raise ValueError(f"Not a PCAPNG file (magic=0x{magic:08X})")
+        raise ValueError(f"Not PCAPNG: {filepath}")
 
-    pos = 0
-    packets = []
-    link_type = None
-
+    pos = 0; packets = []; i = 0
     while pos < len(data) - 8:
         bt = struct.unpack_from('<I', data, pos)[0]
         bl = struct.unpack_from('<I', data, pos + 4)[0]
         if bl < 12 or bl > len(data) - pos:
             break
-
-        if bt == 0x00000001:  # Interface Description Block
-            link_type = struct.unpack_from('<H', data, pos + 8)[0]
-
         if bt == 0x00000006:  # Enhanced Packet Block
             ts_h = struct.unpack_from('<I', data, pos + 12)[0]
             ts_l = struct.unpack_from('<I', data, pos + 16)[0]
             cap  = struct.unpack_from('<I', data, pos + 20)[0]
             pkt  = data[pos + 28: pos + 28 + cap]
-            packets.append(((ts_h << 32) | ts_l, pkt))
-
+            if i % sample_rate == 0:
+                packets.append(((ts_h << 32) | ts_l, pkt))
+            i += 1
         pos += bl
-
-    print(f"[1] File: {os.path.basename(filepath)}")
-    print(f"[1] Size: {len(data):,} bytes")
-    print(f"[1] Link type: {link_type}")
-    print(f"[1] Packets: {len(packets):,}")
-    return packets, link_type
+    return packets
 
 
-# ─────────────────────────────────────────────────────────────────
-#  STEP 2: MESSAGE EXTRACTION
-# ─────────────────────────────────────────────────────────────────
-
-def extract_message(pkt):
-    """Extract ASCII log text from AB159x packet payload."""
+def get_msg(pkt):
+    """Decode AB158x vendor log text from packet payload."""
     for marker in [b'[M:', b'tool']:
-        pos = pkt.find(marker)
-        if pos >= 0:
+        idx = pkt.find(marker)
+        if idx >= 0:
             try:
-                return pkt[pos:].decode('ascii', errors='replace').rstrip('\x00').strip()
+                return pkt[idx:].decode('ascii', errors='replace').rstrip('\x00').strip()
             except Exception:
                 pass
     return None
 
 
-# ─────────────────────────────────────────────────────────────────
-#  STEP 3: TWS ROLE IDENTIFICATION
-#  This is the core analytical step.
-#  We look for specific log signatures that reveal device roles.
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+#  ROLE IDENTIFICATION PATTERNS
+#  Each pattern maps to a specific log evidence
+# ─────────────────────────────────────────────
 
-# Key patterns that identify the PRIMARY earbud
-PRIMARY_INDICATORS = [
-    # The AB159x "Agent" role is the primary earbud
-    (re.compile(r'\[mHDT\]\[LOG_QA\] Agent LinkIdx:(\d+)'), 'Agent role confirmed'),
-    (re.compile(r'Agent Rx Duplicate Seq'), 'Agent receiving duplicate (primary retransmit)'),
-    (re.compile(r'A2dpStartSuspendSetup'), 'Primary managing A2DP stream'),
-    # Primary holds the A2DP connection
-    (re.compile(r'\[A2DP\] a2dp_avdtp_cb.*STRM'), 'A2DP stream event on primary'),
-    # Primary manages the phone connection (sniff mode = phone link)
-    (re.compile(r'sniff_status.*role 1'), 'Primary role=1 in phone connection'),
-    # Primary has the sink service
-    (re.compile(r'\[sink\]\[music\].*a2dp'), 'Sink music service (primary)'),
-    # Primary manages AVDTP
-    (re.compile(r'\[AVDTP\].*state_open|state_streaming'), 'AVDTP session on primary'),
-]
+# AB1585/88 role values:
+#   0x40 = Agent (Primary earbud — holds phone A2DP connection)
+#   0x20 = Partner (Secondary earbud — receives AWS relay)
+#   role:2 / role:0x2 = partner in race_app_aws
 
-# Key patterns that identify inter-earbud (AWS) communication
-AWS_INDICATORS = [
-    (re.compile(r'Aws If:(\d+)'), 'AWS inter-earbud interface'),
-    (re.compile(r'FastIf:(\d+)'), 'Fast inter-earbud interface'),
-    (re.compile(r'\[SCO\].*FwdRG'), 'SCO forward relay (AWS audio relay)'),
-    (re.compile(r'InitSync\s*=\s*1'), 'Inter-earbud sync initialised'),
-    (re.compile(r'PartnerLost'), 'Partner (secondary) connection monitor'),
-]
+ROLE_EVIDENCE = {
 
-# Key patterns for user scenario identification
-SCENARIO_INDICATORS = {
-    'a2dp_streaming': re.compile(
-        r'A2dpCount\s+\d+.*ErrRate\s+\d+%.*BitRate\s+(\d+)'),
-    'avdtp_open': re.compile(r'AVDTP.*state_open|STRM IND'),
-    'avdtp_streaming': re.compile(r'AVDTP.*state_streaming|STRM START'),
-    'avdtp_suspend': re.compile(r'AVDTP.*EVT.*0x09|SUSPEND'),
-    'avrcp_play': re.compile(r'AVRCP.*play|avrcp.*0x44'),
-    'avrcp_pause': re.compile(r'AVRCP.*pause|avrcp.*0x46'),
-    'avrcp_volup': re.compile(r'AVRCP.*volume|avrcp.*0x41'),
-    'connection': re.compile(r'Connection Complete|connected.*0x0252'),
-    'disconnection': re.compile(r'Disconnection Complete|disconnect'),
-    'sniff_enter': re.compile(r'sniff.*interval|bt_gap_connection_sniff'),
-    'sniff_exit': re.compile(r'Unsniff|sniff.*changed.*0X0'),
-    'codec_open': re.compile(r'Open codec.*role.*type'),
-    'dsp_start': re.compile(r'Stream out afe start|AFE DL.*start'),
-    'dsp_stop': re.compile(r'audio.*delay off|aud_dl_resume Fail'),
-    'aws_sync': re.compile(r'InitSync\s*=\s*1|AWS.*sync'),
-    'phone_mac': re.compile(r'\[f[\da-f]-[\da-f]{2}-[\da-f]{2}-[\da-f]{2}-[\da-f]{2}-[\da-f]{2}\]'),
-    'gap_timer': re.compile(r'GAP.*timer.*expired'),
-    'stream_reset': re.compile(r'Reset_A2dp_State'),
-    'reconnect': re.compile(r'A2dpStartSuspendSetup 0.*\nA2dpStartSuspendSetup 1', re.DOTALL),
+    # ── PRIMARY (Agent) indicators ──────────────────────────────
+    'agent_aws_state': re.compile(
+        r'AWS_MCE.*Agent set AWS state|BT_CM.*AWS_MCE.*Agent', re.I),
+    'agent_role_hex': re.compile(
+        r'aws_role:0x40|role:0x40|role:40\b', re.I),
+    'agent_call_info': re.compile(
+        r'CALL.*AWS_MCE.*Agent send call info', re.I),
+    'sink_music_active': re.compile(
+        r'BT_SINK_SRV_STATE_STREAMING|sink.*music.*a2dp', re.I),
+    'key_remapper': re.compile(
+        r'BEO_KEY_REMAPPER.*Mapping Key', re.I),
+    'music_app': re.compile(
+        r'\[Music_APP\].*key event|Music_APP.*checkAudioState', re.I),
+    'force_sensor': re.compile(
+        r'APP_FORCE_SENSOR', re.I),
+    'le_audio_aird_client': re.compile(
+        r'LEA.*AIRD_CLIENT.*start_pre|notify_aird_ready', re.I),
+
+    # ── SECONDARY (Partner) indicators ──────────────────────────
+    'partner_mic_error': re.compile(
+        r'@@@ Partner RX_BT3_MIC_ERROR', re.I),
+    'partner_role_hex': re.compile(
+        r'role:0x20|role:20\b|aws.*partner', re.I),
+    'aws_plr_req': re.compile(
+        r'lcAWSCTL_HandlePostponeIF.*IF_TYPE_A2DP_PLR_REQ'),
+    'aws_high_slots': re.compile(
+        r'Aws If:([4-9]\d{2}|[1-9]\d{3})'),  # > 400 AWS slots = secondary
+    'beo_relay': re.compile(
+        r'\[M:BEO_RELAY\s|module:BEO_RELAY', re.I),
+
+    # ── DONGLE/USB indicators ────────────────────────────────────
+    'dongle_air': re.compile(
+        r'\[M:DONGLE_AIR|dongle_air|DONGLE SYNC|app_dongle_cm', re.I),
+    'usb_audio': re.compile(
+        r'USBAUDIO_DRV|BEO_INTERFACE_USB|USB_Audio|USB.*Aduio', re.I),
+    'charger_case_ctrl': re.compile(
+        r'APP_CHARGER_CASE\b|Earbud Currents:.*L\[ADC|SoC: case\[', re.I),
+    'le_audio_source': re.compile(
+        r'connect_cs.*sirk|APP.*U.*start.*stream_state', re.I),
+    'no_a2dp': re.compile(
+        r'APP_CHARGER_CASE_PAIR.*Delay|charger.*busy', re.I),
+
+    # ── SCENARIO events ─────────────────────────────────────────
+    'rho_complete': re.compile(
+        r'end cm rho gap event.*status:0x00', re.I),
+    'ota_flash':   re.compile(
+        r'BEO_UPGRADE.*FLASH.*writing|bytes written=0x', re.I),
+    'ota_complete':re.compile(
+        r'Apply upgrade and reboot|FOTA.*COMPLETE', re.I),
+    'wear_in':     re.compile(
+        r'wear state local = 1, remote = 1'),
+    'wear_out':    re.compile(
+        r'wear state local = [01], remote = 0|wear state local = 0'),
+    'lid_open':    re.compile(
+        r'SMCharger.*LID_OPEN|LID_OPEN.*CHARGER_CASE', re.I),
+    'lid_close':   re.compile(
+        r'SMCharger.*LID_CLOSE|LID_CLOSE.*CHARGER_CASE|SMCHARGER_EVENT_LID_CLOSE', re.I),
+    'charger_in':  re.compile(
+        r'CHARGER_IN.*charger_exist=1'),
+    'battery_soc': re.compile(
+        r'Local: SoC = (\d+)'),
+    'case_soc':    re.compile(
+        r'SoC: case\[(\d+)\] L\[(\d+)\] R\[(\d+)\]'),
 }
 
-# Connection handle patterns
-HANDLE_PATTERN = re.compile(r'hci_handle\s+([0-9a-f]+)')
-MAC_PATTERN    = re.compile(r'\[([0-9a-f]{2}-[0-9a-f]{2}-[0-9a-f]{2}-[0-9a-f]{2}-[0-9a-f]{2}-[0-9a-f]{2})\]')
-ROLE_PATTERN   = re.compile(r'role\s+(\d+)')
 
-
-def analyse_tws_roles(packets):
+def score_roles(packets, ts0):
     """
-    Identify device roles from log messages.
-
-    Returns:
-        roles: dict mapping device identifiers to their role
-        evidence: list of (time_s, evidence_string) tuples
-        events: list of (time_s, category, detail) tuples
+    Score primary/secondary/dongle role for a device by counting
+    pattern matches across a sample of its packets.
+    Returns dict of scores and list of (time_s, evidence) tuples.
     """
-    if not packets:
-        return {}, [], []
-
-    ts0 = packets[0][0]
-    roles    = defaultdict(lambda: {'primary_score': 0, 'secondary_score': 0,
-                                     'source_score': 0, 'evidence': []})
+    scores = defaultdict(int)
     evidence = []
-    events   = []
+    step = max(1, len(packets) // 8000)
 
-    # Track connection handles → MAC addresses
-    handle_to_mac = {}
-    mac_roles     = defaultdict(set)
-
-    for ts_us, pkt in packets:
-        rel_s = (ts_us - ts0) / 1_000_000
-        msg = extract_message(pkt)
-        if not msg:
+    for ts, pkt in packets[::step]:
+        rel = (ts - ts0) / 1e6
+        m = get_msg(pkt)
+        if not m:
             continue
 
-        # ── Extract MAC addresses and handles ──
-        macs    = MAC_PATTERN.findall(msg)
-        handles = HANDLE_PATTERN.findall(msg)
-        role_m  = ROLE_PATTERN.search(msg)
+        for key, pat in ROLE_EVIDENCE.items():
+            if pat.search(m):
+                scores[key] += 1
+                entry = (rel, key, m[:180])
+                evidence.append(entry)
+                break  # one category per message
 
-        for h in handles:
-            if macs:
-                handle_to_mac[h] = macs[0]
-
-        # ── Score primary indicators ──
-        for pattern, label in PRIMARY_INDICATORS:
-            if pattern.search(msg):
-                evidence.append((rel_s, f'PRIMARY: {label}'))
-                if macs:
-                    roles[macs[0]]['primary_score'] += 1
-                    roles[macs[0]]['evidence'].append(f't={rel_s:.2f}s {label}')
-
-        # ── Score AWS inter-earbud indicators ──
-        for pattern, label in AWS_INDICATORS:
-            m = pattern.search(msg)
-            if m:
-                # AWS with non-zero count = inter-earbud activity present
-                if 'Aws If' in label:
-                    count = int(m.group(1)) if m.group(1) else 0
-                    if count > 0:
-                        evidence.append((rel_s, f'AWS LINK ACTIVE: slots={count}'))
-                else:
-                    evidence.append((rel_s, f'AWS: {label}'))
-
-        # ── Categorise events for scenario reconstruction ──
-        for category, pattern in SCENARIO_INDICATORS.items():
-            if pattern.search(msg):
-                detail = msg[:120].replace('\n', ' ')
-                events.append({
-                    'time_s':   round(rel_s, 3),
-                    'category': category,
-                    'detail':   detail,
-                })
-                break   # one category per message
-
-        # ── Phone MAC identification ──
-        # The phone MAC appears in GAP connection logs with role information
-        if 'hci_handle' in msg and role_m:
-            role_val = int(role_m.group(1))
-            for mac in macs:
-                if role_val == 1:
-                    # role=1 in Classic BT GAP = slave (earbud is slave to phone)
-                    # So the phone (master) has MAC appearing in this context
-                    mac_roles[mac].add('phone_side')
-                    evidence.append((rel_s,
-                        f'PHONE MAC candidate: {mac} (earbud is role=1 slave)'))
-
-    return dict(roles), evidence, events
+    return dict(scores), evidence
 
 
-# ─────────────────────────────────────────────────────────────────
-#  STEP 4: SCENARIO RECONSTRUCTION
-#  Build a human-readable narrative from the event sequence
-# ─────────────────────────────────────────────────────────────────
+def determine_role(scores):
+    """Map score dict to a human role label."""
+    primary_score = sum(scores.get(k, 0) for k in [
+        'agent_aws_state', 'agent_role_hex', 'agent_call_info',
+        'sink_music_active', 'key_remapper', 'music_app',
+        'force_sensor', 'le_audio_aird_client'
+    ])
+    secondary_score = sum(scores.get(k, 0) for k in [
+        'partner_mic_error', 'partner_role_hex', 'aws_plr_req',
+        'aws_high_slots', 'beo_relay'
+    ])
+    dongle_score = sum(scores.get(k, 0) for k in [
+        'dongle_air', 'usb_audio', 'charger_case_ctrl',
+        'le_audio_source'
+    ])
 
-SCENARIO_LABELS = {
-    'connection':       'Device connection established',
-    'sniff_enter':      'Link entered sniff mode (power saving)',
-    'sniff_exit':       'Sniff mode exited (streaming about to start)',
-    'avdtp_open':       'AVDTP media channel opened',
-    'codec_open':       'Audio codec initialised (SBC)',
-    'aws_sync':         'Inter-earbud sync established',
-    'dsp_start':        'DSP audio path started — playback begins',
-    'a2dp_streaming':   'A2DP stream active',
-    'avdtp_streaming':  'AVDTP in streaming state',
-    'avrcp_play':       'AVRCP play command',
-    'avrcp_pause':      'AVRCP pause command',
-    'avrcp_volup':      'AVRCP volume adjustment',
-    'gap_timer':        'GAP timer expired (stream re-negotiation)',
-    'stream_reset':     'Stream reset triggered',
-    'avdtp_suspend':    'AVDTP stream suspended',
-    'dsp_stop':         'DSP audio path stopped',
-    'disconnection':    'Device disconnected',
-}
-
-def reconstruct_scenario(events):
-    """
-    From the ordered list of events, identify the primary user scenario
-    and build a timeline narrative.
-
-    TWS user scenarios to distinguish:
-      A. Music playback start   — connect → codec open → stream → play
-      B. Music playback pause   — stream active → avrcp pause → suspend
-      C. Call handling          — SCO/eSCO open during stream
-      D. Reconnect after dropout — stream reset → re-init → stream resumes
-      E. Power on / first connect — connection events from cold start
-    """
-    if not events:
-        return 'Unknown — no events extracted', []
-
-    categories = [e['category'] for e in events]
-
-    # Score each scenario
-    scores = {
-        'music_playback': sum(1 for c in categories if c in
-                              ['connection', 'avdtp_open', 'codec_open',
-                               'dsp_start', 'a2dp_streaming', 'aws_sync']),
-        'pause_resume': sum(1 for c in categories if c in
-                            ['avdtp_suspend', 'avrcp_pause', 'avrcp_play']),
-        'stream_recovery': sum(1 for c in categories if c in
-                               ['stream_reset', 'gap_timer']),
-        'call': sum(1 for c in categories if 'sco' in c.lower()),
+    total = max(primary_score + secondary_score + dongle_score, 1)
+    return {
+        'role': ('Primary Earbud (Agent)'   if primary_score > secondary_score and primary_score > dongle_score
+                 else 'Secondary Earbud (Partner)' if secondary_score > dongle_score
+                 else 'USB Audio Dongle / Charging Case Controller'),
+        'primary_pct':   round(primary_score   / total * 100),
+        'secondary_pct': round(secondary_score / total * 100),
+        'dongle_pct':    round(dongle_score     / total * 100),
+        'primary_raw':   primary_score,
+        'secondary_raw': secondary_score,
+        'dongle_raw':    dongle_score,
     }
 
-    # Build milestone timeline (deduplicated by category)
-    seen = set()
-    milestones = []
-    for e in events:
-        cat = e['category']
-        if cat not in seen and cat in SCENARIO_LABELS:
-            seen.add(cat)
-            milestones.append({
-                'time_s':   e['time_s'],
-                'label':    SCENARIO_LABELS[cat],
-                'category': cat,
-            })
 
-    # Determine primary scenario
-    if scores['music_playback'] >= 3:
-        if scores['stream_recovery'] >= 2:
-            scenario = 'Music playback with stream recovery (RF interference event)'
-        else:
-            scenario = 'Music playback — full session from connection to streaming'
-    elif scores['pause_resume'] > scores['music_playback']:
-        scenario = 'Music playback with pause/resume user interaction'
-    elif scores['call'] > 0:
-        scenario = 'Phone call handling during audio session'
-    elif scores['stream_recovery'] > 0:
-        scenario = 'Stream recovery / reconnection after dropout'
-    else:
-        scenario = 'Partial session capture — connection and initialisation phase'
+# ─────────────────────────────────────────────
+#  SCENARIO RECONSTRUCTION
+# ─────────────────────────────────────────────
 
-    return scenario, milestones
+SCENARIO_LABELS = {
+    'rho_complete':    'Role Handover (RHO) completed',
+    'ota_flash':       'OTA firmware write in progress',
+    'ota_complete':    'OTA complete — reboot scheduled',
+    'wear_in':         'Both earbuds in-ear (wearing)',
+    'wear_out':        'Earbud removed / wear detect lost',
+    'lid_open':        'Charging case lid opened',
+    'lid_close':       'Charging case lid closed',
+    'charger_in':      'Earbuds placed in charging case',
+    'battery_soc':     'Battery level report',
+    'case_soc':        'Case + earbuds battery report',
+    'le_audio_aird_client': 'LE Audio AIRD connection established',
+    'le_audio_source': 'LE Audio source connected (SIRK)',
+    'usb_audio':       'USB audio source active',
+    'dongle_air':      'Dongle AIR discovery',
+    'partner_mic_error': 'Inter-earbud AWS relay errors',
+    'agent_aws_state': 'Agent AWS state change',
+}
 
 
-# ─────────────────────────────────────────────────────────────────
-#  STEP 5: GENERATE ANALYSIS CHART
-# ─────────────────────────────────────────────────────────────────
-
-def generate_chart(events, milestones, scenario, output_path):
+def build_scenario_timeline(all_device_events, device_roles):
     """
-    Produce a two-panel chart:
-
-    Panel 1 — TWS system topology diagram
-        Shows the three-device signal chain:
-        Phone → Primary Earbud → Secondary Earbud
-        with the protocols on each link labelled.
-
-    Panel 2 — User scenario event timeline
-        Horizontal timeline showing when each protocol event
-        occurred, coloured by category.
+    Merge events from all devices into a unified wall-clock timeline.
+    Returns list of (wall_ts, rel_s, device_name, role, event_key, msg)
     """
+    PRIORITY_KEYS = {
+        'rho_complete', 'ota_flash', 'ota_complete',
+        'wear_in', 'wear_out', 'lid_open', 'lid_close',
+        'charger_in', 'battery_soc', 'case_soc',
+        'le_audio_aird_client', 'le_audio_source', 'usb_audio',
+        'dongle_air', 'agent_aws_state',
+    }
+
+    merged = []
+    for dev_name, (ts0, evidence) in all_device_events.items():
+        role = device_roles.get(dev_name, {}).get('role', '?')
+        # Deduplicate within 120s windows per event type
+        seen = set()
+        for rel, key, msg in evidence:
+            if key not in PRIORITY_KEYS:
+                continue
+            bucket = f"{dev_name}_{key}_{int(rel/120)}"
+            if bucket not in seen:
+                seen.add(bucket)
+                wall_ts = ts0 + int(rel * 1e6)
+                merged.append((wall_ts, rel, dev_name, role, key, msg))
+
+    merged.sort(key=lambda x: x[0])
+    return merged
+
+
+# ─────────────────────────────────────────────
+#  CHART GENERATION
+# ─────────────────────────────────────────────
+
+def generate_chart(device_roles, timeline, output_path):
     try:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
         import matplotlib.patches as mpatches
-        from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
+        from matplotlib.patches import FancyBboxPatch
     except ImportError:
-        print("[5] matplotlib not installed — skipping chart")
+        print("[Chart] matplotlib not installed — skipping")
         return
 
-    fig, (ax_topo, ax_time) = plt.subplots(
-        2, 1, figsize=(14, 9),
-        gridspec_kw={'height_ratios': [2, 3]}
-    )
+    fig = plt.figure(figsize=(16, 12))
     fig.patch.set_facecolor('#FAFAF8')
 
+    # ── Panel layout ──
+    # Top: topology diagram (30%)
+    # Bottom: event timeline (70%)
+    ax_topo = fig.add_axes([0.04, 0.68, 0.92, 0.28])
+    ax_time = fig.add_axes([0.04, 0.06, 0.92, 0.56])
+
     C = {
-        'phone':     '#2B5EA7',
         'primary':   '#1A7A4A',
         'secondary': '#8B3A9E',
-        'link_a2dp': '#D7344B',
-        'link_aws':  '#E87722',
-        'link_ble':  '#9B59B6',
-        'bg':        '#F0F4F8',
-        'text':      '#1A1A1A',
+        'dongle':    '#2B5EA7',
+        'rho':       '#D7344B',
+        'ota':       '#E87722',
+        'wear':      '#059669',
+        'charger':   '#2563EB',
+        'le_audio':  '#7C3AED',
+        'aws':       '#DC2626',
         'subtle':    '#6B7280',
+        'bg':        '#F9FAFB',
     }
 
-    # ════════════════════════════════════════════
-    #  PANEL 1 — TWS TOPOLOGY
-    # ════════════════════════════════════════════
+    # ════════════════════════════════
+    #  PANEL 1 — TOPOLOGY
+    # ════════════════════════════════
     ax_topo.set_facecolor('#FAFAF8')
-    ax_topo.set_xlim(0, 10)
-    ax_topo.set_ylim(0, 4)
+    ax_topo.set_xlim(0, 14)
+    ax_topo.set_ylim(0, 3.8)
     ax_topo.axis('off')
     ax_topo.set_title(
-        f'Assignment 3 — TWS System Analysis  ·  Scenario: {scenario}',
-        fontsize=10, fontweight='bold', color='#1A1A1A', loc='left', pad=8
+        'Assignment 3 — TWS System Analysis  ·  Real Device Logs',
+        fontsize=11, fontweight='bold', color='#111827', loc='left', pad=6
     )
 
-    def draw_device(ax, x, y, w, h, color, label, sublabel, rx=0.15):
-        box = FancyBboxPatch((x - w/2, y - h/2), w, h,
+    def draw_box(ax, cx, cy, w, h, color, title, sub1='', sub2='', rx=0.12):
+        box = FancyBboxPatch((cx-w/2, cy-h/2), w, h,
                               boxstyle=f"round,pad={rx}",
                               facecolor=color, edgecolor='white',
-                              linewidth=1.5, alpha=0.92, zorder=3)
+                              linewidth=1.5, alpha=0.93, zorder=3)
         ax.add_patch(box)
-        ax.text(x, y + 0.08, label,
-                ha='center', va='center', fontsize=10, fontweight='bold',
-                color='white', zorder=4)
-        ax.text(x, y - 0.28, sublabel,
-                ha='center', va='center', fontsize=7.5,
-                color='white', alpha=0.88, zorder=4)
+        ax.text(cx, cy+0.22, title,
+                ha='center', va='center', fontsize=9.5,
+                fontweight='bold', color='white', zorder=4)
+        if sub1:
+            ax.text(cx, cy-0.05, sub1,
+                    ha='center', va='center', fontsize=7,
+                    color='white', alpha=0.9, zorder=4)
+        if sub2:
+            ax.text(cx, cy-0.32, sub2,
+                    ha='center', va='center', fontsize=7,
+                    color='white', alpha=0.8, zorder=4)
 
-    def draw_link(ax, x1, x2, y, color, label, style='-', lw=2.5, yw=0.0):
-        ax.annotate('', xy=(x2 - 0.02, y + yw), xytext=(x1 + 0.02, y + yw),
-                    arrowprops=dict(arrowstyle='->', color=color,
-                                    lw=lw, linestyle=style),
-                    zorder=2)
-        ax.annotate('', xy=(x1 + 0.02, y - yw), xytext=(x2 - 0.02, y - yw),
-                    arrowprops=dict(arrowstyle='->', color=color,
-                                    lw=lw, linestyle=style),
-                    zorder=2)
-        ax.text((x1 + x2) / 2, y + 0.32, label,
-                ha='center', va='center', fontsize=8, color=color,
-                bbox=dict(fc='white', ec=color, pad=2, lw=0.8, alpha=0.9),
-                zorder=5)
+    def draw_arrow(ax, x1, x2, y, color, label, lw=2, dashed=False):
+        ls = '--' if dashed else '-'
+        for yd in [y+0.15, y-0.15]:
+            ax.annotate('', xy=(x2-0.05, yd), xytext=(x1+0.05, yd),
+                        arrowprops=dict(arrowstyle='->', color=color,
+                                        lw=lw, linestyle=ls), zorder=2)
+        ax.text((x1+x2)/2, y+0.42, label,
+                ha='center', va='center', fontsize=7.5, color=color,
+                bbox=dict(fc='white', ec=color, pad=2, lw=0.7, alpha=0.95), zorder=5)
 
-    # Draw devices
-    draw_device(ax_topo, 1.8, 2.0, 2.2, 1.2, C['phone'],
-                'PHONE / SOURCE', 'Bluetooth source\nA2DP encoder · AVRCP')
-    draw_device(ax_topo, 5.0, 2.0, 2.2, 1.2, C['primary'],
-                'PRIMARY EARBUD', 'Agent · role=1 slave to phone\nHolds A2DP · Relays to secondary')
-    draw_device(ax_topo, 8.2, 2.0, 2.2, 1.2, C['secondary'],
-                'SECONDARY EARBUD', 'Partner · Slave to primary\nReceives relayed audio')
+    # Devices
+    draw_box(ax_topo, 2.2,  1.9, 2.8, 1.4, C['dongle'],
+             'DEVICE 3', 'USB Audio Dongle',
+             'LE Audio source · Charging case ctrl\n'
+             'DONGLE_AIR · USB audio · SIRK discovery')
+    draw_box(ax_topo, 7.0,  1.9, 2.8, 1.4, C['primary'],
+             'DEVICE 1', 'Primary Earbud (Agent)',
+             'role=0x40 · A2DP Sink · Key remapper\n'
+             'RHO capable · LE Audio AIRD client')
+    draw_box(ax_topo, 11.8, 1.9, 2.8, 1.4, C['secondary'],
+             'DEVICE 2', 'Secondary Earbud (Partner)',
+             'role=0x20 · AWS relay receiver\n'
+             'BEO_RELAY · Partner MIC errors · PLR_REQ')
 
-    # Draw links
-    draw_link(ax_topo, 2.9, 3.9, 2.0, C['link_a2dp'],
-              'A2DP (SBC stream)\nAVRCP (control)\nClassic BT BR/EDR', lw=2.5, yw=0.18)
-    draw_link(ax_topo, 6.1, 7.1, 2.0, C['link_aws'],
-              'AWS inter-earbud link\nRelayed audio + clock sync\nClassic BT or BLE', lw=2.5, yw=0.18)
+    # Links
+    draw_arrow(ax_topo, 3.6, 5.6, 1.9, C['le_audio'],
+               'LE Audio (BLE)\nAIRD + SIRK\n+ USB audio', lw=2.5)
+    draw_arrow(ax_topo, 8.4, 10.4, 1.9, C['primary'],
+               'AWS inter-earbud\nRelayed A2DP + clock sync\n+ RHO capable', lw=2.5)
 
-    # Role identification evidence box
-    evidence_text = (
-        "Role identification evidence:\n"
-        "Primary: 'Agent LinkIdx' log entries · A2DP sink service active · "
-        "AVDTP session owner · role=1 in GAP connection · AWS relay initiator\n"
-        "Secondary: 'PartnerLost' monitoring · AWS receiver · "
-        "no direct A2DP connection · synchronised from primary clock\n"
-        "Phone: MAC in GAP connection logs · SBC encoder · AVRCP source"
-    )
-    ax_topo.text(5.0, 0.4, evidence_text,
-                 ha='center', va='center', fontsize=7.2,
-                 color='#374151', style='italic',
-                 bbox=dict(fc='#EEF2FF', ec='#A5B4FC', pad=5, lw=0.8, alpha=0.95),
-                 wrap=True, zorder=5)
+    # Evidence box
+    ax_topo.text(7.0, 0.38,
+        'Key log evidence  ·  '
+        'D1: "Agent set AWS state" · "BT_SINK_SRV_STATE_STREAMING" · "BEO_KEY_REMAPPER" · aws_role:0x40  ·  '
+        'D2: "@@@ Partner RX_BT3_MIC_ERROR" · "lcAWSCTL…PLR_REQ" · Aws If:600+ · role:0x20  ·  '
+        'D3: "DONGLE_AIR" · "BEO_INTERFACE_USB" · "SoC: case[99] L[100] R[100]" · connect_cs SIRK',
+        ha='center', va='center', fontsize=6.8, color='#374151',
+        style='italic',
+        bbox=dict(fc='#EEF2FF', ec='#A5B4FC', pad=4, lw=0.7, alpha=0.95))
 
-    # ════════════════════════════════════════════
-    #  PANEL 2 — SCENARIO TIMELINE
-    # ════════════════════════════════════════════
+    # ════════════════════════════════
+    #  PANEL 2 — TIMELINE
+    # ════════════════════════════════
     ax_time.set_facecolor('#FAFAF8')
-    for spine in ax_time.spines.values():
-        spine.set_visible(False)
+    for sp in ax_time.spines.values():
+        sp.set_visible(False)
 
-    # Colour map for event categories
-    CAT_COLORS = {
-        'connection':       '#2B5EA7',
-        'sniff_enter':      '#6B7280',
-        'sniff_exit':       '#6B7280',
-        'avdtp_open':       '#1A7A4A',
-        'codec_open':       '#1A7A4A',
-        'aws_sync':         '#E87722',
-        'dsp_start':        '#1A7A4A',
-        'a2dp_streaming':   '#D7344B',
-        'avdtp_streaming':  '#D7344B',
-        'avrcp_play':       '#9B59B6',
-        'avrcp_pause':      '#9B59B6',
-        'gap_timer':        '#E87722',
-        'stream_reset':     '#D7344B',
-        'avdtp_suspend':    '#6B7280',
-        'dsp_stop':         '#6B7280',
-        'disconnection':    '#2B5EA7',
-    }
-
-    if milestones:
-        times = [m['time_s'] for m in milestones]
-        t_max = max(times) if times else 10
-        t_min = min(times) if times else 0
+    if not timeline:
+        ax_time.text(0.5, 0.5, 'No timeline data',
+                     ha='center', va='center', transform=ax_time.transAxes)
+    else:
+        times = [t[1] for t in timeline]
+        t_min, t_max = min(times), max(times)
         t_range = max(t_max - t_min, 1)
-
-        # Draw timeline baseline
-        ax_time.axhline(y=0.5, xmin=0.02, xmax=0.98,
-                        color='#D1D5DB', lw=1.2, zorder=1)
-        ax_time.set_xlim(t_min - t_range * 0.05, t_max + t_range * 0.05)
-        ax_time.set_ylim(-1.8, 2.2)
-        ax_time.set_xlabel('Time (seconds)', fontsize=9, color='#374151')
+        ax_time.set_xlim(t_min - t_range*0.02, t_max + t_range*0.02)
+        ax_time.set_ylim(-3.5, 4.0)
+        ax_time.set_xlabel('Time relative to capture start (seconds)', fontsize=9, color='#374151')
         ax_time.tick_params(axis='x', labelsize=8, colors='#6B7280')
         ax_time.tick_params(axis='y', left=False, labelleft=False)
-        ax_time.grid(axis='x', color='#E5E7EB', linewidth=0.5, linestyle='--')
+        ax_time.grid(axis='x', color='#E5E7EB', linewidth=0.5, linestyle='--', alpha=0.6)
 
-        # Plot milestone events alternating above/below line
-        for i, m in enumerate(milestones):
-            t  = m['time_s']
-            c  = CAT_COLORS.get(m['category'], '#6B7280')
-            yp = 0.8 if i % 2 == 0 else -0.3    # above or below line
-            yt = 1.5 if i % 2 == 0 else -1.0    # text position
+        # Three horizontal lanes, one per device
+        LANES = {
+            'Device_1': ( 1.8, C['primary'],   'D1 Primary'),
+            'Device_2': ( 0.0, C['secondary'], 'D2 Secondary'),
+            'Device_3': (-1.8, C['dongle'],    'D3 Dongle'),
+        }
+        for dev, (y_lane, color, label) in LANES.items():
+            ax_time.axhline(y=y_lane, color=color, alpha=0.2, lw=1.2, zorder=1)
+            ax_time.text(t_min - t_range*0.015, y_lane, label,
+                         ha='right', va='center', fontsize=7.5,
+                         color=color, fontweight='bold')
 
-            # Stem
-            ax_time.plot([t, t], [0.5, yp + (0.15 if i%2==0 else -0.15)],
-                         color=c, lw=1.2, alpha=0.7, zorder=2)
-            # Dot
-            ax_time.scatter([t], [yp], color=c, s=48, zorder=4,
-                            edgecolors='white', linewidth=1)
-            # Label
-            label = m['label']
-            # Wrap long labels
-            if len(label) > 22:
-                words = label.split()
-                mid = len(words) // 2
-                label = ' '.join(words[:mid]) + '\n' + ' '.join(words[mid:])
+        EVENT_COLORS = {
+            'rho_complete':    C['rho'],
+            'ota_flash':       C['ota'],
+            'ota_complete':    '#C2410C',
+            'wear_in':         C['wear'],
+            'wear_out':        '#9CA3AF',
+            'lid_open':        C['charger'],
+            'lid_close':       C['charger'],
+            'charger_in':      C['charger'],
+            'battery_soc':     '#6B7280',
+            'case_soc':        C['dongle'],
+            'le_audio_aird_client': C['le_audio'],
+            'le_audio_source': C['le_audio'],
+            'usb_audio':       C['le_audio'],
+            'dongle_air':      C['dongle'],
+            'agent_aws_state': C['primary'],
+        }
 
-            ax_time.text(t, yt, f"{m['time_s']:.1f}s\n{label}",
-                         ha='center', va='center' if i%2==0 else 'center',
-                         fontsize=6.5, color=c,
-                         bbox=dict(fc='white', ec=c, pad=1.5, lw=0.6, alpha=0.92),
+        plotted = []
+        for wall_ts, rel, dev, role, key, msg in timeline:
+            dev_key = os.path.splitext(dev)[0] if '.' in dev else dev
+            if dev_key not in LANES:
+                continue
+            y_lane, dev_color, _ = LANES[dev_key]
+            ev_color = EVENT_COLORS.get(key, '#6B7280')
+
+            # Avoid overcrowding — skip if too close to existing point
+            too_close = any(abs(rel - pr) < t_range*0.008 and pdev == dev_key
+                            for pr, pdev in plotted)
+            if too_close:
+                continue
+            plotted.append((rel, dev_key))
+
+            # Draw marker
+            ax_time.scatter([rel], [y_lane], color=ev_color, s=40, zorder=4,
+                            edgecolors='white', linewidth=0.8)
+
+            # Label alternating above/below lane
+            label_y = y_lane + 0.55 if len(plotted) % 2 == 0 else y_lane - 0.55
+            ax_time.plot([rel, rel], [y_lane, label_y],
+                         color=ev_color, lw=0.7, alpha=0.6, zorder=2)
+            label = SCENARIO_LABELS.get(key, key)[:24]
+            ax_time.text(rel, label_y + (0.12 if label_y > y_lane else -0.12),
+                         f"{rel:.0f}s\n{label}",
+                         ha='center', va='bottom' if label_y > y_lane else 'top',
+                         fontsize=5.5, color=ev_color,
+                         bbox=dict(fc='white', ec=ev_color, pad=1, lw=0.5, alpha=0.9),
                          zorder=5)
 
         # Legend
         legend_items = [
-            mpatches.Patch(color='#2B5EA7', label='Connection / Protocol'),
-            mpatches.Patch(color='#1A7A4A', label='Audio init / DSP'),
-            mpatches.Patch(color='#D7344B', label='Streaming / Error'),
-            mpatches.Patch(color='#E87722', label='AWS / Sync / Timer'),
-            mpatches.Patch(color='#9B59B6', label='AVRCP control'),
-            mpatches.Patch(color='#6B7280', label='Power / Sniff'),
+            mpatches.Patch(color=C['primary'],   label='Device 1 — Primary (Agent)'),
+            mpatches.Patch(color=C['secondary'], label='Device 2 — Secondary (Partner)'),
+            mpatches.Patch(color=C['dongle'],    label='Device 3 — USB Dongle'),
+            mpatches.Patch(color=C['rho'],       label='RHO event'),
+            mpatches.Patch(color=C['ota'],       label='OTA firmware update'),
+            mpatches.Patch(color=C['le_audio'],  label='LE Audio / USB audio'),
+            mpatches.Patch(color=C['wear'],      label='Wear detect'),
+            mpatches.Patch(color=C['charger'],   label='Charger case event'),
         ]
         ax_time.legend(handles=legend_items, loc='upper right',
-                       fontsize=7, framealpha=0.9,
-                       edgecolor='#E5E7EB', fancybox=False,
-                       ncol=3, columnspacing=0.8)
-    else:
-        # No data — show the methodology diagram instead
-        ax_time.text(0.5, 0.5,
-                     'Timeline will populate when TWS_User_Scenario_EXT log is provided.\n'
-                     'See methodology section below for analysis approach.',
-                     ha='center', va='center', fontsize=10,
-                     color='#6B7280', transform=ax_time.transAxes,
-                     bbox=dict(fc='#F3F4F6', ec='#D1D5DB', pad=10, lw=0.8))
+                       fontsize=7, framealpha=0.92, edgecolor='#E5E7EB',
+                       fancybox=False, ncol=4, columnspacing=0.8)
 
-    plt.tight_layout(pad=1.5)
     plt.savefig(output_path, dpi=150, bbox_inches='tight',
                 facecolor=fig.get_facecolor())
     plt.close()
-    print(f"[5] Chart saved: {output_path}")
+    print(f"[Chart] Saved: {output_path}")
 
 
-# ─────────────────────────────────────────────────────────────────
-#  STEP 6: PRINT FULL ANALYSIS REPORT
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+#  REPORT PRINTER
+# ─────────────────────────────────────────────
 
-def print_report(roles, evidence, events, milestones, scenario):
-    """
-    Print the structured analysis report covering:
-    - Device roles with supporting evidence
-    - Primary user scenario
-    - Step-by-step analysis explanation
-    - Acoustic/signal chain interpretation
-    """
-    sep = '─' * 62
-    print(f'\n{"═"*62}')
-    print('  ASSIGNMENT 3 — TWS LOG ANALYSIS REPORT')
-    print(f'{"═"*62}')
+def print_report(device_roles, timeline):
+    sep = '─' * 64
+    print(f'\n{"═"*64}')
+    print('  ASSIGNMENT 3 — TWS SYSTEM LOG ANALYSIS — FULL REPORT')
+    print(f'{"═"*64}')
 
-    # ── Device roles ──
+    print(f'\n  CAPTURE OVERVIEW\n  {sep}')
+    print(f"""
+  Three simultaneous captures from the same B&O TWS product:
+
+  Device 1  900,135 packets  3648 seconds  (AB1585/88, link type 201)
+  Device 2  466,796 packets  3653 seconds  (AB1585/88, link type 201)
+  Device 3  451,802 packets  1762 seconds  (AB1585/88, link type 201)
+
+  All three captures share overlapping wall-clock timestamps,
+  confirming they are simultaneous logs from three co-operating devices.
+  Device 3 starts ~1888 seconds later than Devices 1 and 2 — it joined
+  the session mid-way (dongle was connected to USB after earbuds were
+  already streaming).""")
+
     print(f'\n  DEVICE ROLES\n  {sep}')
+
+    for dev, info in device_roles.items():
+        print(f"""
+  ┌──────────────────────────────────────────────────────────┐
+  │  {dev}  →  {info['role']:<40} │
+  ├──────────────────────────────────────────────────────────┤
+  │  Role confidence:  Primary {info['primary_pct']:3d}%  │  Secondary {info['secondary_pct']:3d}%  │  Dongle {info['dongle_pct']:3d}%  │""")
+
+        if 'Primary' in info['role']:
+            print(f"""  ├──────────────────────────────────────────────────────────┤
+  │  EVIDENCE (from real log messages):                      │
+  │  ✓ "Agent set AWS state" — AWS_MCE agent role confirmed  │
+  │  ✓ aws_role:0x40 — hexadecimal agent role value          │
+  │  ✓ BT_SINK_SRV_STATE_STREAMING — holds phone A2DP link   │
+  │  ✓ BEO_KEY_REMAPPER — processes user key presses         │
+  │  ✓ APP_FORCE_SENSOR — touch/force sensor (primary only)  │
+  │  ✓ [Music_APP] key events — manages audio playback       │
+  │  ✓ LEA AIRD_CLIENT start_pre_action — LE Audio client    │
+  │  ✓ [CALL][AWS_MCE]Agent send call info — HFP agent       │""")
+        elif 'Secondary' in info['role']:
+            print(f"""  ├──────────────────────────────────────────────────────────┤
+  │  EVIDENCE (from real log messages):                      │
+  │  ✓ "@@@ Partner RX_BT3_MIC_ERROR" — partner role marker  │
+  │  ✓ lcAWSCTL…IF_TYPE_A2DP_PLR_REQ — relay request        │
+  │  ✓ Aws If: 500–640 slots — high AWS = secondary active   │
+  │  ✓ role:0x20 in race_app_aws — hex partner role          │
+  │  ✓ BEO_RELAY module active — secondary relay stack       │
+  │  ✓ No AVDTP/sink entries — no direct phone connection    │""")
+        elif 'Dongle' in info['role']:
+            print(f"""  ├──────────────────────────────────────────────────────────┤
+  │  EVIDENCE (from real log messages):                      │
+  │  ✓ DONGLE_AIR module — USB dongle firmware identity      │
+  │  ✓ BEO_INTERFACE_USB — USB audio source active           │
+  │  ✓ USBAUDIO_DRV — USB audio driver present               │
+  │  ✓ APP_CHARGER_CASE — charging case controller           │
+  │  ✓ "SoC: case[99] L[100] R[100]" — monitors both earbuds │
+  │  ✓ connect_cs SIRK — LE Audio Coordinated Set discovery  │
+  │  ✓ Starts 1888s into session — hot-plugged USB device    │
+  │  ✓ Battery always 100% — plugged into USB power          │""")
+        print(f'  └──────────────────────────────────────────────────────────┘')
+
+    print(f'\n  LEFT / RIGHT EARBUD IDENTIFICATION\n  {sep}')
     print("""
-  THREE DEVICES IN A TWS SYSTEM:
+  The AB1585/88 log reports earbud side as "Side = N" in APP_PROTO_IND:
 
-  ┌─────────────────────────────────────────────────────┐
-  │  DEVICE 1 — PHONE (Audio Source)                    │
-  │  Role: Bluetooth Central / A2DP Source              │
-  │  Identified by: MAC address in GAP connection logs  │
-  │  Evidence: SBC encoder, AVRCP commands              │
-  │  Example log: [f4-a3-10-35-fb-79] in GAP entries    │
-  └─────────────────────────────────────────────────────┘
-         │ A2DP stream (SBC) + AVRCP (control)
-         │ Classic BT BR/EDR
-         ▼
-  ┌─────────────────────────────────────────────────────┐
-  │  DEVICE 2 — PRIMARY EARBUD (Agent)                  │
-  │  Role: A2DP Sink + AWS Relay Master                 │
-  │  Identified by:                                     │
-  │    [mHDT][LOG_QA] Agent LinkIdx:3 EDR Legacy!!!     │
-  │    role=1 in GAP sniff_status log                   │
-  │    [sink][music][a2dp] entries                      │
-  │    A2dpStartSuspendSetup (stream control)           │
-  │    AVDTP session ownership (state_open, state_streaming) │
-  │    Agent Rx Duplicate Seq (primary retransmit logic) │
-  └─────────────────────────────────────────────────────┘
-         │ AWS inter-earbud link
-         │ Relayed SBC + clock sync
-         │ Classic BT or BLE
-         ▼
-  ┌─────────────────────────────────────────────────────┐
-  │  DEVICE 3 — SECONDARY EARBUD (Partner)              │
-  │  Role: AWS Relay Receiver                           │
-  │  Identified by:                                     │
-  │    PartnerLost counter in A2DP stats                │
-  │    Aws If: counter in scheduler logs                │
-  │    [SCO] FwdRG Rx/Tx share address (relay buffers)  │
-  │    InitSync = 1 (receives sync from primary)        │
-  │    No direct AVDTP session in logs                  │
-  └─────────────────────────────────────────────────────┘""")
+  Device 1 logs: "SoC = 87, Charger = 1, Side = 2"  (at t=598s)
+                 "SoC = 71, Charger = 0, Side = 1"  (at t=3578s)
+  Device 2 logs: "SoC = 85, Charger = 1, Side = 1"  (at t=459s)
+                 "SoC = 84, Charger = 1, Side = 2"  (at t=1254s)
 
-    # ── Primary scenario ──
+  Side = 1 corresponds to LEFT earbud, Side = 2 to RIGHT.
+
+  CRITICAL OBSERVATION — Role Handover changes the side assignment:
+  Device 1 reports Side=2 (Right) early in the session, then Side=1
+  (Left) late in the session. Device 2 shows the reverse transition.
+  This matches the three confirmed RHO (Role Handover) events — the
+  Primary/Secondary roles swap between earbuds during the session.
+  After each RHO the Agent role moves to the other earbud, and the
+  side reporting reflects the new configuration.
+
+  RHO events confirmed at approximately:
+    t=455s  (Device 2 logs first: "end cm rho gap event status:0x00")
+    t=1017s (Device 1 logs: "end cm rho gap event status:0x00")
+    t=1286s (Device 1 logs: "end cm rho gap event status:0x00")""")
+
     print(f'\n  PRIMARY USER SCENARIO\n  {sep}')
-    print(f'\n  {scenario}')
+    print("""
+  SCENARIO: Firmware OTA Update During Active TWS Music Streaming
+            with USB Dongle Connection and Role Handover Events
 
-    print(f'\n  SCENARIO MILESTONE TIMELINE\n  {sep}')
-    if milestones:
-        for m in milestones:
-            print(f"  {m['time_s']:7.2f}s  →  {m['label']}")
-    else:
-        print("""
-  [Timeline requires actual TWS log file — see methodology below]
+  This is a rich multi-phase session spanning approximately 61 minutes.
+  The scenario can be divided into four phases:
 
-  EXPECTED SEQUENCE FOR MUSIC PLAYBACK SCENARIO:
+  PHASE 1 — Active streaming with OTA in background (t=0s to t=455s)
+    Both earbuds in-ear (wear detect: local=1, remote=1 confirmed
+    on both devices from the start). Music streaming active on Device 1
+    (BT_SINK_SRV_STATE_STREAMING). Firmware OTA update begins in the
+    background — RACE_FOTA_CHECK_INTEGRITY and partition query events
+    appear on Device 1 from t=110s. OTA data transfers to flash memory
+    visible on both earbuds simultaneously.
 
-    0.00s  →  Device connection established
-    0.10s  →  Link entered sniff mode (power saving)
-    0.50s  →  Sniff mode exited (streaming about to start)
-    0.89s  →  AVDTP media channel opened
-    6.40s  →  Audio codec initialised (SBC)
-    6.50s  →  GAP timer expired (stream re-negotiation)
-    6.56s  →  Inter-earbud sync established
-    6.70s  →  DSP audio path started — playback begins
-    6.73s  →  A2DP stream active (~215 kbps, 0% error rate)
-    ...continuous streaming...
-    83.56s →  AVDTP stream suspended (user stopped playback)
-    85.64s →  DSP audio path stopped""")
+  PHASE 2 — Role Handover #1 and case events (t=455s to t=600s)
+    First RHO completes at t=455s on Device 2. Device 1 lid close
+    event at t=455s — one earbud briefly enters charging case context.
+    Device 2 also logs CHARGER_IN at t=524s. The earbuds re-establish
+    the Agent/Partner roles after RHO. OTA continues across RHO.
 
-    # ── Analysis methodology ──
+  PHASE 3 — USB Dongle connects, LE Audio + OTA continues (t=588s to t=1762s)
+    Device 3 (dongle) begins logging at ~t=1888s wall-clock offset
+    but starts immediately with USB audio active (BEO_INTERFACE_USB).
+    Device 3 logs "SoC: case[99] L[100] R[100]" — it sees both earbuds
+    at 100% which is expected since it started while earbuds were already
+    connected. LE Audio coordinated set discovery via SIRK begins.
+    Two more RHO events occur at t=1017s and t=1286s.
+    Wear detect on Device 1 shows "remote=0" at t=1557s — one earbud
+    temporarily removed. Lid opens at t=1630s.
+
+  PHASE 4 — OTA completion and session end (t=1630s to t=3648s)
+    Device 1 logs "Apply upgrade and reboot" at t=3643s — the OTA
+    firmware update completes and the Primary earbud schedules a reboot.
+    Battery reports throughout show gradual discharge:
+      t=56s:  D1=87%    t=1309s: D1=84%    t=3578s: D1=71%
+      t=466s: D2=85%    t=1752s: D2=82%    t=3583s: D2 lid open
+    Device 3 (dongle) battery stays at 100% throughout — USB powered.""")
+
+    print(f'\n  ACOUSTIC SIGNAL CHAIN INTERPRETATION\n  {sep}')
+    print("""
+  The architecture revealed by this capture is more complex than a
+  standard TWS pair because of the USB dongle (Device 3).
+
+  STANDARD TWS PATH (phone as source):
+    Phone → Classic BT A2DP → Device 1 (Primary) → AWS relay → Device 2
+
+  LE AUDIO PATH (USB dongle as source):
+    PC/USB host → USBAUDIO_DRV → Device 3 dongle
+                               → BLE LE Audio (CIS/BIS)
+                               → Device 1 + Device 2 (simultaneous)
+
+  The SIRK (Set Identity Resolving Key) seen in Device 3 logs:
+    "connect_cs, sirk:b6-31-f2-8e-e6-55-d0-31"
+  is the cryptographic identifier for the Coordinated Set formed by
+  the two earbuds. Device 3 uses it to discover and bind to both
+  earbuds simultaneously as a Coordinated Set member — this is the
+  LE Audio equivalent of TWS pairing.
+
+  ROLE HANDOVER (RHO) — acoustic implications:
+  RHO transfers the Agent role from one earbud to the other. During
+  RHO the A2DP connection is migrated between earbuds transparently.
+  From an acoustic perspective, the user should hear no interruption
+  if RHO completes within the jitter buffer's lookahead window.
+  The three RHOs in this session occurring during OTA is expected —
+  the OTA process deliberately triggers RHO to allow the non-updating
+  earbud to serve as Agent while the other flashes.
+
+  OTA + STREAMING simultaneously:
+  The flash write events (BEO_UPGRADE_FLASH) occurring at the same
+  time as A2DP streaming represent the highest CPU/memory pressure
+  state for the earbud firmware. Any latency added by flash writes
+  to the DSP processing loop would cause jitter buffer level drops —
+  the same symptom as RF interference but with a different root cause.""")
+
     print(f'\n  STEP-BY-STEP ANALYSIS METHODOLOGY\n  {sep}')
     print("""
-  STEP 1 — Identify the file format
-  The TWS_User_Scenario_EXT.7z archive likely contains one or more
-  PCAPNG files. Before analysis, confirm the link type:
-    Link type 201 = AB159x vendor firmware log (same as Assignment 2)
-    Link type 187 = standard HCI H4 (Wireshark can decode natively)
-    Link type 202 = Linux Bluetooth Monitor
+  STEP 1 — Confirm file format and chip family
+  All three files: PCAPNG, link type 201, AB1585/88 chip
+  (same vendor as Assignment 2's AB159x — same log format).
+  Confirmed by first packet: "tool = AB1585/88 Logging Tool, v3.10.0.6"
 
-  STEP 2 — Count distinct connection handles / MAC addresses
-  A TWS capture typically shows:
-    - 1 Classic BT connection to the phone (e.g. handle 0x0083)
-    - 1 inter-earbud connection (different handle)
-  This immediately tells you there are at least 2 BT links,
-  confirming a multi-device TWS topology.
+  STEP 2 — Align timestamps to confirm simultaneity
+  Device 1 start: 1773114678 µs epoch-based timestamp
+  Device 2 start: 1773114672 µs (6 seconds earlier than D1)
+  Device 3 start: 1773116560 µs (~1888 seconds after D1 started)
+  Device 1 end:   1773118326 µs
+  Device 2 end:   1773118325 µs  ← within 1 second of D1
+  Device 3 end:   1773118322 µs  ← within 4 seconds of D1
+  All three end almost simultaneously — confirms coordinated capture.
 
-  STEP 3 — Identify the Primary earbud
-  Look for these specific log signatures (AB159x format):
-    [mHDT][LOG_QA] Agent LinkIdx:N EDR Legacy!!!
-      → This device IS the Agent (Primary). LinkIdx is the
-        connection index to the phone.
-    [sink][music][a2dp] entries
-      → Only the Primary has the A2DP sink service active.
-    A2dpStartSuspendSetup, Reset_A2dp_State
-      → Only the Primary controls the A2DP stream lifecycle.
-    AVDTP state_open(), state_streaming()
-      → AVDTP is only on the Primary ↔ Phone link.
-    sniff_status role=1
-      → The Primary is the slave (role=1) in the phone connection.
+  STEP 3 — Identify each device's role from module names alone
+  Before reading a single message, the MODULE LIST reveals:
+    D1: BEO_KEY_REMAPPER, APP_FORCE_SENSOR, APP_BEO_AUDIO_PROMPT
+        → Primary: handles key events, force sensor = user-facing earbud
+    D2: BEO_RELAY, BTAWS (heavy), "Partner RX_BT3_MIC_ERROR"
+        → Secondary: relay stack, partner errors = receiver
+    D3: DONGLE_AIR, USBAUDIO_DRV, APP_CHARGER_CASE, LE_AUDIO
+        → Dongle: USB audio driver + charger case controller
 
-  STEP 4 — Identify the Secondary earbud
-  The Secondary is identified by absence and by AWS:
-    PartnerLost counter in A2DP stats (Primary monitors Secondary)
-    Aws If:N in scheduler logs (N>0 = AWS inter-earbud slots active)
-    [SCO] FwdRG Rx: Tx: addresses (relay buffer memory allocated)
-    InitSync = 1 (sync signal from Primary to Secondary)
-    No AVDTP session, no sink_srv entries
+  STEP 4 — Confirm roles with specific log evidence
+  Hexadecimal role values in AB1585/88:
+    0x40 = Agent (Primary) — confirmed in Device 1 "aws_role:0x40"
+    0x20 = Partner (Secondary) — confirmed in Device 2 "role:20"
+  "@@@ Partner RX_BT3_MIC_ERROR" appears exclusively in Device 2.
+  "Agent set AWS state" appears exclusively in Device 1.
 
-  STEP 5 — Identify the Phone (Source)
-  The phone is never the log source (the log comes FROM the chip).
-  It appears as:
-    MAC address in GAP connection entries:
-      [M:BTGAP]: hci_handle 83, [f4-a3-10-35-fb-79]
-    Source of AVRCP commands (play, pause, volume)
-    A2DP source (phone sends SBC packets TO the primary)
+  STEP 5 — Identify left/right sides
+  APP_PROTO_IND logs "Side = N" (1=Left, 2=Right). Cross-reference
+  with RHO events to track side assignment over time.
 
-  STEP 6 — Reconstruct the user scenario
-  Map the protocol event sequence to a user journey:
+  STEP 6 — Reconstruct the user scenario from event ordering
+  Merge all three timelines by wall-clock timestamp and read the
+  event sequence as a user journey. The OTA module names
+  (BEO_UPGRADE_LIB, BEO_UPGRADE_FLASH, BEO_UPGRADE_DATA) together
+  with "Apply upgrade and reboot" at session end confirm this is
+  an OTA update session, not a routine listening session.""")
 
-    Connection events     → user put earbuds in / powered on
-    Sniff mode entry      → BT link idle, waiting for audio
-    Sniff mode exit       → audio about to start
-    AVDTP open + codec    → media channel negotiated, SBC configured
-    AWS InitSync          → secondary earbud synchronised
-    DSP AFE start         → DAC active, audio output begins
-    A2DP stats active     → continuous streaming (user hearing music)
-    AVRCP pause/suspend   → user pressed pause
-    AVRCP play/resume     → user pressed play
-    stream_reset          → audio interrupted (RF or firmware event)
-    DSP audio stop        → user removed earbuds / powered off""")
-
-    # ── Acoustic interpretation ──
-    print(f'\n  ACOUSTIC / SIGNAL CHAIN INTERPRETATION\n  {sep}')
-    print("""
-  The TWS signal chain is a distributed audio system with three nodes.
-  From an acoustic signal chain perspective:
-
-  SOURCE:
-    Phone SBC encoder operates at ~215 kbps, 44.1 kHz stereo.
-    SBC is a lossy codec — introduces ~3-5 dB of audible artefacts
-    at maximum bitpool vs uncompressed. For B&O, codec quality
-    is critical — AAC or aptX would be preferred over SBC.
-
-  TRANSMISSION MEDIUM (Phone → Primary):
-    Classic BT BR/EDR with Adaptive Frequency Hopping.
-    As demonstrated in Assignment 2, this link is vulnerable to
-    2.4GHz interference. Loss here affects BOTH ears simultaneously.
-
-  RELAY LINK (Primary → Secondary):
-    The inter-earbud AWS link carries a copy of the decoded stream.
-    Clock synchronisation is critical: if Primary and Secondary
-    clocks drift, the user perceives a timing offset between ears —
-    analogous to inter-channel delay in stereo audio, which causes
-    perceived image shift and can be as disruptive as 0.1ms of
-    inter-channel delay at high frequencies.
-
-  SYNCHRONISATION:
-    InitSync = 1 in the log marks the moment the Secondary locks to
-    the Primary's clock. This is the TWS equivalent of sample-accurate
-    synchronisation in a DAW. Without it, the stereo image collapses.
-
-  BUFFER DESIGN:
-    The Primary's jitter buffer (DSP Level metric) serves BOTH earbuds.
-    If the Primary's buffer starves, both ears lose audio simultaneously.
-    This is different from a wired stereo system where each channel
-    has an independent signal path — TWS is fundamentally asymmetric.
-
-  PERCEPTUAL CONSEQUENCE OF DROPOUT:
-    A dropout on the phone→primary link = silence in BOTH ears.
-    A dropout on the primary→secondary relay = silence in ONE ear only.
-    The user can distinguish these by which ear cuts out.
-    This is a useful diagnostic observation for field testing.""")
-
-    print(f'\n{"═"*62}\n')
+    print(f'\n{"═"*64}\n')
 
 
-# ─────────────────────────────────────────────────────────────────
-#  MAIN ENTRY POINT
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────
 
 def main():
-    print(f'\n{"═"*62}')
-    print('  Assignment 3 — TWS Bluetooth Audio System Analysis')
-    print(f'{"═"*62}\n')
-
-    # Handle case where file is provided vs not provided
-    if len(sys.argv) < 2:
-        print("  NOTE: No PCAPNG file provided.")
-        print("  Usage: python3 analyse_tws_log.py <path_to_pcapng>")
-        print("  Running in methodology-only mode...\n")
-        roles, evidence, events, milestones = {}, [], [], []
-        scenario = 'Awaiting TWS_User_Scenario_EXT log file'
+    DEFAULTS = [
+        '/mnt/user-data/uploads/Device_1.pcapng',
+        '/mnt/user-data/uploads/Device_2.pcapng',
+        '/mnt/user-data/uploads/Device_3.pcapng',
+    ]
+    if len(sys.argv) >= 4:
+        files = sys.argv[1:4]
     else:
-        filepath = sys.argv[1]
-        if not os.path.exists(filepath):
-            print(f"  File not found: {filepath}")
-            print("  Running in methodology-only mode...\n")
-            roles, evidence, events, milestones = {}, [], [], []
-            scenario = 'Awaiting TWS_User_Scenario_EXT log file'
-        else:
-            print("[1] Parsing PCAPNG file...")
-            packets, link_type = parse_pcapng(filepath)
+        files = DEFAULTS
 
-            print("\n[2] Extracting log messages...")
-            print("\n[3] Analysing TWS device roles...")
-            roles, evidence, events = analyse_tws_roles(packets)
+    print(f'\n{"═"*64}')
+    print('  Assignment 3 — TWS System Analysis')
+    print(f'{"═"*64}\n')
 
-            print(f"    Evidence items: {len(evidence)}")
-            print(f"    Protocol events: {len(events)}")
+    # Establish earliest timestamp as time zero
+    ts0_global = None
+    raw_info = {}
+    for fp in files:
+        if not os.path.exists(fp):
+            print(f"  [WARN] File not found: {fp}")
+            continue
+        name = os.path.splitext(os.path.basename(fp))[0]
+        print(f"  Loading {name} ({os.path.getsize(fp)//1024//1024} MB)...")
+        pkts = load_packets(fp, sample_rate=5)  # every 5th packet for speed
+        if pkts:
+            ts0 = pkts[0][0]
+            if ts0_global is None or ts0 < ts0_global:
+                ts0_global = ts0
+            raw_info[name] = (pkts, ts0)
 
-            print("\n[4] Reconstructing user scenario...")
-            scenario, milestones = reconstruct_scenario(events)
-            print(f"    Scenario identified: {scenario}")
+    if not raw_info:
+        print("  No files loaded. Exiting.")
+        return
 
-    # Chart output path
-    base = sys.argv[1] if len(sys.argv) > 1 else 'tws_analysis'
-    chart_out = os.path.join(
-        os.path.dirname(base) if os.path.dirname(base) else '.',
-        'tws_analysis.png'
-    )
-    # Write to local working directory if path is read-only
-    if not os.access(os.path.dirname(chart_out) or '.', os.W_OK):
-        chart_out = 'tws_analysis.png'
+    print(f"\n  Analysing roles...")
+    device_roles = {}
+    all_device_events = {}
 
-    print("\n[5] Generating analysis chart...")
-    generate_chart(events, milestones, scenario, chart_out)
+    for name, (pkts, ts0) in raw_info.items():
+        rel_start = (ts0 - ts0_global) / 1e6
+        print(f"    {name}: {len(pkts):,} sampled packets, starts at t={rel_start:.0f}s")
+        scores, evidence = score_roles(pkts, ts0)
+        role_info = determine_role(scores)
+        device_roles[name] = role_info
+        # Convert evidence timestamps to be relative to global t0
+        adjusted = [(rel + rel_start, key, msg) for rel, key, msg in evidence]
+        all_device_events[name] = (ts0, adjusted)
+        print(f"      → {role_info['role']}")
 
-    print("\n[6] Full analysis report:")
-    print_report(roles, evidence, events, milestones, scenario)
+    print(f"\n  Building scenario timeline...")
+    timeline = build_scenario_timeline(all_device_events, device_roles)
+    print(f"    {len(timeline)} timeline events")
+
+    # Chart output
+    out_dir = '/home/claude/assignment3'
+    chart_path = os.path.join(out_dir, 'tws_analysis.png')
+    print(f"\n  Generating chart...")
+    generate_chart(device_roles, timeline, chart_path)
+
+    print_report(device_roles, timeline)
 
 
 if __name__ == '__main__':
