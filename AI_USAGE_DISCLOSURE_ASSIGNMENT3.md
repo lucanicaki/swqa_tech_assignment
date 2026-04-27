@@ -1,4 +1,4 @@
-# AI Tool Usage Disclosure — Assignment 3 (Real Files)
+# AI Tool Usage Disclosure — Assignment 3
 
 **Assignment:** Software QA Technical Assignment — Bang & Olufsen  
 **Task:** TWS Bluetooth Audio System Log Analysis — Device_1/2/3.pcapng  
@@ -10,7 +10,7 @@
 
 I used **Claude (Anthropic, claude-sonnet model)**, consistent with Assignments 1 and 2.
 
-I needed a coding partner who could help me process large binary files efficiently, reason about ambiguous log evidence, and structure findings coherently. Claude served that role.
+I needed a coding partner who could help me process large binary files efficiently, reason about ambiguous log evidence, and structure findings coherently. Claude served that role. I also used it for formatting to make my solution more structured, which would give me a competitive advantage.
 
 ---
 
